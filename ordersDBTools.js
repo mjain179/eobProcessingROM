@@ -198,10 +198,69 @@ async function insertEOBInteraction(
   return pool.query(text, [channel, timestamp, length, from_id, to_id, attachment, raw_content]);
 }
 
+/**
+ * Check whether a story log row already exists for this story with EOB status.
+ * @param {number} story_id
+ * @returns {Promise<boolean>}
+ */
+async function checkExistingEOBStoryLog(story_id) {
+  const text = `
+    SELECT COUNT(*) AS count
+    FROM story
+    WHERE story_id = $1
+    AND status = 'EOB'
+  `;
+  const result = await pool.query(text, [story_id]);
+  return parseInt(result.rows[0].count, 10) > 0;
+}
+
+/**
+ * Update story_fresh status to EOB for a given story.
+ * @param {number} story_id
+ * @param {Date|string|null} created_at - timestamp to set (defaults to NOW() if null)
+ */
+async function updateStoryFreshToEOB(story_id, created_at = null) {
+  const text = `
+    UPDATE story_fresh
+    SET
+      status     = 'EOB',
+      created_at = COALESCE($2, NOW()),
+      username   = 'service@motusnova.com'
+    WHERE story_id = $1
+  `;
+  return pool.query(text, [story_id, created_at]);
+}
+
+/**
+ * Insert a story log row with EOB status.
+ * @param {number} story_id
+ * @param {number} destination - patient contact ID
+ * @param {number} origin      - DME contact ID
+ * @param {Date|string|null} created_at - timestamp to set (defaults to NOW() if null)
+ */
+async function insertStoryEOBLog(story_id, destination, origin, created_at = null) {
+  const text = `
+    INSERT INTO story (
+      story_id,
+      type,
+      status,
+      destination,
+      origin,
+      created_at,
+      username
+    )
+    VALUES ($1, 'insurance', 'EOB', $2, $3, COALESCE($4, NOW()), 'service@motusnova.com')
+  `;
+  return pool.query(text, [story_id, destination, origin, created_at]);
+}
+
 module.exports = {
   updateInsuranceFreshWithEOBData,
   updateInsuranceFreshWithSecondaryEOBData,
   insertInsuranceEOBLog,
   insertSecondaryInsuranceEOBLog,
   insertEOBInteraction,
+  checkExistingEOBStoryLog,
+  updateStoryFreshToEOB,
+  insertStoryEOBLog,
 };
