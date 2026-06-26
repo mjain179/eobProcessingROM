@@ -52,6 +52,25 @@ const parsePaymentDate = (paymentDOS) => {
   }
 };
 
+// Function to call the EOB talk script reminder endpoint
+const callEobTalkScript = async (storyId) => {
+  try {
+    const response = await fetch('https://two.motusnova.com/postal/reminders/eobTalkScript', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ insurance_id: storyId }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return true;
+  } catch (error) {
+    console.warn(`⚠️ eobTalkScript call failed for story ${storyId}:`, error.message);
+    return false;
+  }
+};
+
 // Function to read and parse CSV file
 const readCsvFile = (filePath) => {
   return new Promise((resolve, reject) => {
@@ -415,6 +434,7 @@ const processStoryStatus = async (csvFilePath, precomputed = null) => {
         if (r.action === 'updateAndLog') {
           await ordersDBtools.updateStoryFreshToEOB(r.insuranceId, r.paymentDate);
           await ordersDBtools.insertStoryEOBLog(r.insuranceId, r.patientContactId, r.dmeContactId, r.paymentDate);
+          await callEobTalkScript(r.insuranceId);
           console.log(`  ✅ ${r.fullName}: story_fresh -> EOB + log inserted (was ${r.currentStatus}, dated ${r.paymentDOSRaw || 'NOW'})`);
         } else if (r.action === 'logOnly') {
           // Re-check at write time in case state changed since the preview
@@ -450,7 +470,7 @@ const processStoryStatus = async (csvFilePath, precomputed = null) => {
 if (require.main === module) {
   const args = process.argv.slice(2);
   const apply = args.includes('--apply');
-  const csvFilePath = args.find((a) => !a.startsWith('--')) || 'patient_data2026_25.csv';
+  const csvFilePath = args.find((a) => !a.startsWith('--')) || 'patient_data2026_31.csv';
 
   if (!apply) {
     console.log(`DRY RUN — previewing story status updates for: ${csvFilePath}`);
