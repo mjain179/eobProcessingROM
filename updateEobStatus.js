@@ -4,6 +4,11 @@ const ordersDBtools = require('./ordersDBTools');
 const fs = require('fs');
 const Papa = require('papaparse');
 
+// Patient emails and texts are queued through the Communication System
+const NOTIFICATIONS_URL = 'https://two.motusnova.com/CommunicationSystem/notifications';
+const EOB_TEMPLATE_NAME = 'EOB_clinicReferral';
+const NOTIFICATION_USERNAME = 'story_status_processor'; // sent as _metadata.username (required)
+
 console.log('📄 STORY STATUS PROCESSOR SCRIPT 📄');
 console.log('📋 This script updates story_fresh/story tables based on insurance status for existing patients\n');
 
@@ -69,6 +74,127 @@ const callEobTalkScript = async (storyId) => {
     console.warn(`⚠️ eobTalkScript call failed for story ${storyId}:`, error.message);
     return false;
   }
+};
+
+// Format the product the way patients see it (MotusHand -> Motus Hand)
+const formatProduct = (product) => {
+  if (product === 'MotusHand') return 'Motus Hand';
+  if (product === 'MotusFoot') return 'Motus Foot';
+  return product || 'device';
+};
+
+// Trim a name and treat the '#NA' placeholder as empty
+const cleanName = (value) => {
+  if (value == null) return '';
+  const name = String(value).trim().replace(/[\r\n]+/g, ' ');
+  return name === '#NA' ? '' : name;
+};
+
+// Patient + DME details needed for the EOB_clinicReferral template variables
+const getEobNotificationData = async (insuranceId) => {
+  const query = `
+    SELECT
+      p.first_name   AS patient_first_name,
+      p.last_name    AS patient_last_name,
+      p.email        AS patient_email,
+      p.phone_number AS patient_phone,
+      i.product,
+      d.first_name   AS dme_first_name
+    FROM story_fresh s
+    JOIN contacts_fresh p ON p.contact_id = s.destination
+    LEFT JOIN insurance_fresh i ON i.insurance_id = s.story_id
+    LEFT JOIN contacts_fresh d ON d.contact_id = s.origin
+    WHERE s.story_id = $1
+      AND s.type = 'insurance'
+    LIMIT 1
+  `;
+  const result = await db.query(query, [insuranceId]);
+  return result.rows[0] || null;
+};
+
+// Queue one notification (same request shape as the patient packet webhook)
+const queueNotification = async (payload) => {
+  // undefined is dropped by JSON.stringify and the server would reject the
+  // request for a missing variable; null is kept and renders as empty text.
+  const body = {};
+  for (const [key, value] of Object.entries(payload)) {
+    body[key] = value === undefined ? null : value;
+  }
+  body.includeAlternates = false;
+  body.scheduledFor = null; // send now, not backdated to PaymentDOS
+  body._metadata = {
+    timestamp: new Date().toISOString(),
+    username: NOTIFICATION_USERNAME,
+    formId: 'processStoryStatus',
+  };
+
+  try {
+    const response = await fetch(NOTIFICATIONS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(`HTTP ${response.status} ${detail}`);
+    }
+    return true;
+  } catch (error) {
+    console.warn(
+      `⚠️ Failed to queue ${payload.templateName} (${payload.channel}) for contact ${payload.recipient}: ${error.message}`
+    );
+    return false;
+  }
+};
+
+// Queue the EOB_clinicReferral email + text for a story just moved to EOB.
+// Returns a status per channel ('queued' | 'failed' | 'skipped (...)'). Never throws,
+// so a notification problem can't mark an already-committed story update as an error.
+const sendEobNotifications = async (r) => {
+  const status = { email: 'failed', text: 'failed' };
+  try {
+    const data = await getEobNotificationData(r.insuranceId);
+    if (!data) {
+      console.warn(`⚠️ No patient/DME data for story ${r.insuranceId}, notifications not queued`);
+      return status;
+    }
+
+    const variables = {
+      patient_first_name: cleanName(data.patient_first_name) || 'there',
+      product: formatProduct(data.product),
+      dme_first_name: cleanName(data.dme_first_name) || 'your DME provider',
+    };
+    const patientName =
+      [data.patient_first_name, data.patient_last_name].map(cleanName).filter(Boolean).join(' ') || 'Patient';
+
+    if (data.patient_email) {
+      const ok = await queueNotification({
+        templateName: EOB_TEMPLATE_NAME,
+        channel: 'email',
+        Subject: `Motus Nova - Insurance Claim Update for ${patientName} (#${r.insuranceId})`,
+        recipient: r.patientContactId,
+        ...variables,
+      });
+      status.email = ok ? 'queued' : 'failed';
+    } else {
+      status.email = 'skipped (no email)';
+    }
+
+    if (data.patient_phone) {
+      const ok = await queueNotification({
+        templateName: EOB_TEMPLATE_NAME,
+        channel: 'text',
+        recipient: r.patientContactId,
+        ...variables,
+      });
+      status.text = ok ? 'queued' : 'failed';
+    } else {
+      status.text = 'skipped (no phone)';
+    }
+  } catch (error) {
+    console.warn(`⚠️ Could not queue EOB notifications for story ${r.insuranceId}:`, error.message);
+  }
+  return status;
 };
 
 // Function to read and parse CSV file
@@ -180,7 +306,7 @@ const getInsuranceDataForContact = async (contactId) => {
 
 // Determine what action a record would trigger, WITHOUT writing to the database.
 // Returns one of:
-//   { action: 'updateAndLog' }      -> submitted/readyToBill: story_fresh update + story log insert
+//   { action: 'updateAndLog' }      -> submitted/readyToBill: story_fresh update + story log insert + notifications
 //   { action: 'logOnly' }           -> other status, no existing EOB log: story log insert
 //   { action: 'skipAlreadyEOB' }    -> status already EOB: nothing to do
 //   { action: 'skipLogExists' }     -> other status but EOB log already exists: nothing to do
@@ -251,7 +377,7 @@ const resolveRecord = async (row, contactsMap) => {
 const describeAction = (action) => {
   switch (action) {
     case 'updateAndLog':
-      return 'WILL UPDATE story_fresh -> EOB + INSERT story log';
+      return `WILL UPDATE story_fresh -> EOB + INSERT story log + QUEUE ${EOB_TEMPLATE_NAME} email/text`;
     case 'logOnly':
       return 'WILL INSERT EOB story log';
     case 'skipAlreadyEOB':
@@ -264,7 +390,7 @@ const describeAction = (action) => {
 };
 
 // Build the list of records to be processed and print/export a preview report.
-// Performs only READ queries — no writes.
+// Performs only READ queries — no writes, and no notifications are queued.
 const previewStoryStatus = async (csvFilePath, { exportCsv = true } = {}) => {
   console.log(`📖 Reading CSV file: ${csvFilePath}`);
 
@@ -359,7 +485,7 @@ const previewStoryStatus = async (csvFilePath, { exportCsv = true } = {}) => {
 
   console.log('\n=== PREVIEW SUMMARY ===');
   console.log(`✅ Will be updated: ${willUpdate.length}`);
-  console.log(`   ↳ story_fresh update + log (submitted/readyToBill): ${willUpdate.filter((r) => r.action === 'updateAndLog').length}`);
+  console.log(`   ↳ story_fresh update + log + notifications (submitted/readyToBill): ${willUpdate.filter((r) => r.action === 'updateAndLog').length}`);
   console.log(`   ↳ log insert only (other status): ${willUpdate.filter((r) => r.action === 'logOnly').length}`);
   console.log(`⏭️ Matched but no action: ${willSkip.length}`);
   console.log(`   ↳ already EOB: ${willSkip.filter((r) => r.action === 'skipAlreadyEOB').length}`);
@@ -428,6 +554,7 @@ const processStoryStatus = async (csvFilePath, precomputed = null) => {
 
     let processedCount = 0;
     let errorCount = 0;
+    const notificationFailures = []; // stories moved to EOB whose email/text could not be queued
 
     for (const r of willUpdate) {
       try {
@@ -435,7 +562,22 @@ const processStoryStatus = async (csvFilePath, precomputed = null) => {
           await ordersDBtools.updateStoryFreshToEOB(r.insuranceId, r.paymentDate);
           await ordersDBtools.insertStoryEOBLog(r.insuranceId, r.patientContactId, r.dmeContactId, r.paymentDate);
           await callEobTalkScript(r.insuranceId);
-          console.log(`  ✅ ${r.fullName}: story_fresh -> EOB + log inserted (was ${r.currentStatus}, dated ${r.paymentDOSRaw || 'NOW'})`);
+
+          // story_fresh AND story log are now EOB -> queue EOB_clinicReferral email + text
+          const notified = await sendEobNotifications(r);
+          if (notified.email === 'failed' || notified.text === 'failed') {
+            notificationFailures.push({
+              fullName: r.fullName,
+              contactId: r.patientContactId,
+              storyId: r.insuranceId,
+              ...notified,
+            });
+          }
+
+          console.log(
+            `  ✅ ${r.fullName}: story_fresh -> EOB + log inserted (was ${r.currentStatus}, dated ${r.paymentDOSRaw || 'NOW'})` +
+              ` | email: ${notified.email}, text: ${notified.text}`
+          );
         } else if (r.action === 'logOnly') {
           // Re-check at write time in case state changed since the preview
           const eobLogExists = await ordersDBtools.checkExistingEOBStoryLog(r.insuranceId);
@@ -458,6 +600,10 @@ const processStoryStatus = async (csvFilePath, precomputed = null) => {
     console.log('\n=== STORY STATUS PROCESSING COMPLETE ===');
     console.log(`✅ Story records changed: ${processedCount}`);
     console.log(`❌ Errors: ${errorCount}`);
+    console.log(`📨 Notification failures: ${notificationFailures.length}`);
+    notificationFailures.forEach((f) =>
+      console.log(`   ↳ ${f.fullName} | Contact ${f.contactId} | Story ${f.storyId} | email: ${f.email}, text: ${f.text}`)
+    );
   } catch (error) {
     console.error('❌ Error in processStoryStatus:', error.message);
     throw error;
@@ -465,12 +611,12 @@ const processStoryStatus = async (csvFilePath, precomputed = null) => {
 };
 
 // Command line usage
-//   node processStoryStatus.js <csv>            -> PREVIEW only (default, safe)
-//   node processStoryStatus.js <csv> --apply    -> preview then apply updates
+//   node processStoryStatus.js <csv>            -> PREVIEW only (default, safe; no notifications)
+//   node processStoryStatus.js <csv> --apply    -> preview then apply updates and queue notifications
 if (require.main === module) {
   const args = process.argv.slice(2);
   const apply = args.includes('--apply');
-  const csvFilePath = args.find((a) => !a.startsWith('--')) || 'patient_data2026_31.csv';
+  const csvFilePath = args.find((a) => !a.startsWith('--')) || 'patient_data2026_60.csv';
 
   if (!apply) {
     console.log(`DRY RUN — previewing story status updates for: ${csvFilePath}`);
@@ -509,4 +655,5 @@ module.exports = {
   parseFullName,
   getExistingContacts,
   getInsuranceDataForContact,
+  sendEobNotifications,
 };
